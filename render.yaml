@@ -1,0 +1,125 @@
+# Render.com Deployment Configuration for Q-Storm Platform
+# Documentation: https://render.com/docs/blueprint-spec
+
+services:
+  # Flask Web Service
+  - type: web
+    name: qstorm-platform
+    env: python
+    region: oregon  # Free tier available regions: oregon, frankfurt, singapore
+    plan: free
+
+    # Build Configuration
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app_improved.py
+
+    # Runtime Configuration
+    runtime: python
+    pythonVersion: "3.10"
+
+    # Health Check Configuration
+    healthCheckPath: /health
+
+    # Auto-Deploy Configuration
+    branch: main
+    autoDeploy: true
+
+    # Environment Variables
+    envVars:
+      # Application Environment
+      - key: FLASK_ENV
+        value: production
+
+      # Authentication (REQUIRED for production)
+      # Generate with: python3 -c "from auth import generate_api_key; print(generate_api_key())"
+      - key: QSTORM_API_KEY
+        generateValue: true  # Render will auto-generate on first deploy
+        sync: false
+
+      # File Upload Configuration
+      - key: MAX_FILE_SIZE_MB
+        value: "200"
+
+      # Database Configuration
+      - key: DATABASE_PATH
+        value: /opt/render/project/src/data/qstorm.db
+
+      # Upload & Output Directories
+      - key: UPLOAD_FOLDER
+        value: /opt/render/project/src/uploads
+
+      # Optional: OpenAI API Key (for future features)
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # Python Configuration
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # Flask Configuration
+      - key: FLASK_APP
+        value: app_improved.py
+
+    # Persistent Disk for SQLite Database
+    disk:
+      name: qstorm-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+
+    # Scaling Configuration (Free tier: 1 instance, 512MB RAM, 0.5 CPU)
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+
+# Additional Notes:
+#
+# 1. Free Tier Limitations:
+#    - 512 MB RAM
+#    - 0.5 CPU
+#    - Service spins down after 15 minutes of inactivity
+#    - 750 hours/month of runtime (shared across all free services)
+#    - Persistent disk included (1GB)
+#
+# 2. QSTORM_API_KEY Setup:
+#    After first deployment, you MUST set a secure API key:
+#    - Go to Render Dashboard → qstorm-platform → Environment
+#    - Find QSTORM_API_KEY (auto-generated value)
+#    - Replace with secure key: python3 -c "from auth import generate_api_key; print(generate_api_key())"
+#    - Save and trigger manual deploy
+#
+# 3. Database Persistence:
+#    - SQLite database stored in persistent disk at /opt/render/project/src/data
+#    - Data persists across deployments and restarts
+#    - Automatic backups not included in free tier
+#
+# 4. Cold Start Behavior:
+#    - Free tier services sleep after 15 minutes of inactivity
+#    - First request after sleep takes 30-60 seconds (cold start)
+#    - Keep-alive services not recommended for free tier
+#
+# 5. Monitoring & Logs:
+#    - Access logs via Render Dashboard → Logs tab
+#    - Free tier: 7 days of log retention
+#    - Health check at /health endpoint
+#
+# 6. Upgrade Path:
+#    - Starter plan ($7/month): No sleep, 1GB RAM, 1 CPU
+#    - Standard plan ($25/month): 2GB RAM, 2 CPU, background workers
+#
+# 7. Environment-Specific Configuration:
+#    - Development: Set FLASK_ENV=development (no auth required)
+#    - Production: Set FLASK_ENV=production (auth required)
+#
+# 8. CORS Configuration:
+#    - Currently configured for localhost origins
+#    - Update CORS settings in app_improved.py for production domain
+#
+# 9. SSL/TLS:
+#    - Automatic HTTPS included (Let's Encrypt)
+#    - Custom domains available on paid plans
+#
+# 10. Deployment Process:
+#     - Push to main branch → Auto-deploy triggered
+#     - Build: Install dependencies from requirements.txt
+#     - Start: Execute python app_improved.py
+#     - Health check: Verify /health endpoint responds 200 OK
