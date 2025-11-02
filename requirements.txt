@@ -9,3 +9,7 @@ Flask-Limiter==3.3.0
 pyarrow==11.0.0
 fastparquet==2023.2.0
 xlrd==2.0.1
+langchain
+openai
+tiktoken
+langchain-openai

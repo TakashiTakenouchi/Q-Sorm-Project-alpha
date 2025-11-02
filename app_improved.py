@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 import time
+from scipy import stats
 
 import numpy as np
 import pandas as pd
@@ -17,11 +18,14 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
 
 import config
 from db_manager import DatabaseManager
 from export_manager import MarkdownExporter
 from auth import require_api_key
+from lang_agent.chain import DEFAULT_CATEGORY_COLUMNS as LANGCHAIN_DEFAULT_CATEGORIES
+from lang_agent.chain import generate_store_comparison
 
 
 # Flask application setup -----------------------------------------------------
@@ -40,7 +44,7 @@ exporter = MarkdownExporter()
 # CORS configuration
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:3000", "http://localhost:5000"],
+        "origins": ["http://localhost:3001", "http://localhost:5004"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": False
@@ -53,6 +57,18 @@ limiter = Limiter(
     default_limits=["1000 per day", "100 per hour"],
     storage_uri="memory://"
 )
+
+
+# データストレージ（メモリベース）
+data_storage = {}
+
+# アップロード設定
+ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls'}
+MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 # Logging configuration -------------------------------------------------------
@@ -131,6 +147,39 @@ def validate_store(store: Optional[str]) -> Optional[str]:
     return store
 
 
+def filter_dataframe_by_date(df: pd.DataFrame, start_date_str: Optional[str], end_date_str: Optional[str]) -> pd.DataFrame:
+    """Apply date range filters to the DataFrame if dates are provided."""
+    if not start_date_str and not end_date_str:
+        return df
+
+    try:
+        date_series = prepare_datetime_index(df)
+    except ValueError:
+        logger.warning("Date filter requested but no valid date column found.")
+        return df
+
+    df_filtered = df.copy()
+    df_filtered['__temp_date__'] = date_series
+
+    if start_date_str:
+        try:
+            start_ts = pd.to_datetime(start_date_str)
+            start_ts = start_ts.normalize()
+            df_filtered = df_filtered[df_filtered['__temp_date__'] >= start_ts]
+        except Exception:
+            pass
+
+    if end_date_str:
+        try:
+            end_ts = pd.to_datetime(end_date_str)
+            end_ts = end_ts.normalize() + pd.Timedelta(days=1, microseconds=-1)
+            df_filtered = df_filtered[df_filtered['__temp_date__'] <= end_ts]
+        except Exception:
+            pass
+
+    return df_filtered.drop(columns=['__temp_date__'])
+
+
 # Session utilities -----------------------------------------------------------
 
 
@@ -196,6 +245,14 @@ def load_session_dataframe(session_id: str) -> pd.DataFrame:
     return df
 
 
+def get_dataframe_for_analysis(session_id: str) -> pd.DataFrame:
+    """Fetch dataframe from in-memory storage or fall back to disk."""
+    df = data_storage.get(session_id)
+    if df is not None:
+        return df.copy()
+    return load_session_dataframe(session_id)
+
+
 # Analysis helpers ------------------------------------------------------------
 
 
@@ -249,9 +306,24 @@ class TimeSeriesAnalyzer:
         resampled = metric_series.resample(self._TIME_UNIT_TO_FREQ[time_unit]).sum().dropna()
         if resampled.empty:
             raise ValueError('No data points available after resampling')
-        chart = self._build_chart(resampled, metric, time_unit)
-        stats = self._build_statistics(resampled)
-        return {'chart': chart, 'statistics': stats}
+
+        # Frontend expects: dates, values, trend_values, statistics
+        dates = [ts.to_pydatetime().isoformat() for ts in resampled.index]
+        values = [float(v) for v in resampled.values]
+
+        # Calculate trend line using scipy.stats.linregress
+        x_numeric = np.arange(len(values))
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x_numeric, values)
+        trend_values = [float(slope * x + intercept) for x in x_numeric]
+
+        statistics = self._build_statistics(resampled, slope, intercept, r_value ** 2)
+
+        return {
+            'dates': dates,
+            'values': values,
+            'trend_values': trend_values,
+            'statistics': statistics
+        }
 
     def _prepare_metric_series(self, metric: str, store: Optional[str]) -> pd.Series:
         df = filter_store(self.df, store)
@@ -288,17 +360,17 @@ class TimeSeriesAnalyzer:
         return chart
 
     @staticmethod
-    def _build_statistics(series: pd.Series) -> Dict[str, Any]:
+    def _build_statistics(series: pd.Series, slope: float, intercept: float, r_squared: float) -> Dict[str, Any]:
         values = series.values
         return {
-            'count': int(series.count()),
-            'total': float(np.sum(values)),
             'mean': float(np.mean(values)),
             'median': float(np.median(values)),
+            'std': float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
             'min': float(np.min(values)),
             'max': float(np.max(values)),
-            'std': float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
-            'latest_timestamp': series.index.max().to_pydatetime().isoformat(),
+            'trend_slope': float(slope),
+            'trend_intercept': float(intercept),
+            'r_squared': float(r_squared),
         }
 
 
@@ -312,14 +384,34 @@ class HistogramAnalyzer:
         df = filter_store(self.df, store)
         if metric not in df.columns:
             raise ValueError(f"Metric column '{metric}' not found in dataset")
-        values = pd.to_numeric(df[metric], errors='coerce').dropna().to_numpy()
+
+        # pd.to_numeric は validate_upload で実行済みだが、安全のため再度実行
+        # np.isfinite を使い、NaN と inf の両方を除外する
+        series = pd.to_numeric(df[metric], errors='coerce')
+        values = series[np.isfinite(series)].to_numpy()
+
         if values.size == 0:
             raise ValueError('Metric column contains no valid numeric data')
-        counts, bin_edges = np.histogram(values, bins=bins)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        chart = self._build_chart(metric, counts, bin_edges, bin_centers)
-        stats = self._build_statistics(values)
-        return {'chart': chart, 'statistics': stats}
+
+        # ヒストグラム計算（エッジケース対応）
+        try:
+            counts, bin_edges = np.histogram(values, bins=bins)
+        except Exception as e:
+            # データが1件しかない場合や、すべて同じ値の場合のビニング失敗をキャッチ
+            logger.warning(f"np.histogram failed: {e}. Using single bin.")
+            min_val = np.min(values)
+            max_val = np.max(values)
+            counts = np.array([values.size])
+            bin_edges = np.array([min_val, max_val]) if max_val > min_val else np.array([min_val, min_val + 1])
+
+        # Frontend expects: bin_edges, frequencies, statistics
+        statistics = self._build_statistics(values)
+
+        return {
+            'bin_edges': [float(edge) for edge in bin_edges],
+            'frequencies': [int(c) for c in counts],
+            'statistics': statistics
+        }
 
     @staticmethod
     def _build_chart(metric: str, counts: np.ndarray, bin_edges: np.ndarray, bin_centers: np.ndarray) -> Dict[str, Any]:
@@ -344,13 +436,53 @@ class HistogramAnalyzer:
 
     @staticmethod
     def _build_statistics(values: np.ndarray) -> Dict[str, Any]:
+        # Calculate basic statistics
+        mean_val = float(np.mean(values))
+        median_val = float(np.median(values))
+        std_val = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+        min_val = float(np.min(values))
+        max_val = float(np.max(values))
+
+        # Calculate skewness and kurtosis using scipy.stats
+        from scipy.stats import skew, kurtosis, shapiro
+
+        # エッジケース対応: すべて同じ値、または極端な値の場合に例外が発生する
+        try:
+            skewness = float(skew(values))
+        except Exception as e:
+            logger.warning(f"Skewness calculation failed: {e}. Setting to 0.0")
+            skewness = 0.0
+
+        try:
+            kurt = float(kurtosis(values))
+        except Exception as e:
+            logger.warning(f"Kurtosis calculation failed: {e}. Setting to 0.0")
+            kurt = 0.0
+
+        # Shapiro-Wilk test for normality
+        if values.size >= 3:
+            try:
+                shapiro_stat, shapiro_p = shapiro(values)
+                is_normal = shapiro_p > 0.05
+            except Exception as e:
+                logger.warning(f"Shapiro-Wilk test failed: {e}. Setting defaults.")
+                shapiro_stat, shapiro_p = 0.0, 1.0
+                is_normal = False
+        else:
+            shapiro_stat, shapiro_p = 0.0, 1.0
+            is_normal = False
+
         return {
-            'count': int(values.size),
-            'mean': float(np.mean(values)),
-            'median': float(np.median(values)),
-            'min': float(np.min(values)),
-            'max': float(np.max(values)),
-            'std': float(np.std(values, ddof=1)) if values.size > 1 else 0.0,
+            'mean': mean_val,
+            'median': median_val,
+            'std': std_val,
+            'min': min_val,
+            'max': max_val,
+            'skewness': skewness,
+            'kurtosis': kurt,
+            'shapiro_statistic': float(shapiro_stat),
+            'shapiro_pvalue': float(shapiro_p),
+            'is_normal': bool(is_normal),  # JSON serialization のため明示的に bool 変換
         }
 
 
@@ -567,6 +699,141 @@ def build_error_response(message: str, status_code: int = 400, code: Optional[st
 # API endpoints ---------------------------------------------------------------
 
 
+@app.route('/api/v2/upload/validate', methods=['POST'])
+def validate_upload():
+    """ファイルアップロードの検証"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'ファイルがありません'}), 400
+
+        file = request.files['file']
+
+        if not file or file.filename == '':
+            return jsonify({'error': 'ファイルが選択されていません'}), 400
+
+        # ファイル名のサニタイズ
+        filename = secure_filename(file.filename)
+
+        # 拡張子チェック
+        if not allowed_file(filename):
+            return jsonify({'error': f'許可されていないファイル形式です。許可: {", ".join(ALLOWED_EXTENSIONS)}'}), 400
+
+        # ファイルサイズチェック
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+
+        if file_size > MAX_FILE_SIZE:
+            return jsonify({
+                'error': f'ファイルサイズが大きすぎます (最大: {MAX_FILE_SIZE/1024/1024:.0f}MB)',
+                'file_size': f'{file_size/1024/1024:.1f}MB'
+            }), 400
+
+        # ファイル内容の検証
+        try:
+            if filename.endswith('.csv'):
+                df = pd.read_csv(file, encoding='utf-8-sig')
+            else:
+                df = pd.read_excel(file)
+
+            # 必須カラムチェック
+            required_columns = ['shop', 'Date']
+            missing = [col for col in required_columns if col not in df.columns]
+
+            if missing:
+                return jsonify({'error': f'必須カラムが不足: {missing}'}), 400
+
+            # データ検証結果
+            validation_result = {
+                'valid': True,
+                'rows': len(df),
+                'columns': list(df.columns),
+                'numeric_columns': list(df.select_dtypes(include=[np.number]).columns),
+                'date_columns': [],
+                'shops': [],
+                'date_range': {}
+            }
+
+            # 店舗情報の抽出
+            if 'shop' in df.columns:
+                validation_result['shops'] = df['shop'].unique().tolist()
+
+            # 日付情報の抽出
+            if 'Date' in df.columns:
+                try:
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    validation_result['date_columns'].append('Date')
+                    validation_result['date_range'] = {
+                        'min': df['Date'].min().strftime('%Y-%m-%d'),
+                        'max': df['Date'].max().strftime('%Y-%m-%d')
+                    }
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+            # 主要なメトリックカラムをあらかじめ数値型に変換
+            # これにより、V2 APIでの 'sum()' TypeError を防ぐ
+            metrics_to_convert = [
+                'Total_Sales', 'gross_profit', 'Operating_profit',
+                'Number_of_guests', 'Price_per_customer',
+                'Mens_JACKETS&OUTER2', 'Mens_KNIT', 'Mens_PANTS',
+                "WOMEN'S_JACKETS2", "WOMEN'S_TOPS", "WOMEN'S_ONEPIECE",
+                "WOMEN'S_bottoms", "WOMEN'S_SCARF & STOLES"
+            ]
+            for col in metrics_to_convert:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            # セッションにデータを保存
+            session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            data_storage[session_id] = df
+
+            # フロントエンド(api.ts UploadResponse)が要求する形式でレスポンスを構築
+            response_payload = {
+                'session_id': session_id,
+                'filename': filename,
+                'columns': validation_result['columns'],
+                'row_count': validation_result['rows'],
+                'available_shops': validation_result.get('shops', []),
+                'date_range': {
+                    'start': validation_result.get('date_range', {}).get('min', ''),
+                    'end': validation_result.get('date_range', {}).get('max', '')
+                }
+            }
+
+            # データベースにセッションを保存
+            try:
+                db.create_session(
+                    session_id=session_id,
+                    file_path=filename,
+                    file_name=filename,
+                    file_size=file_size,
+                    metadata={
+                        'rows': len(df),
+                        'columns': list(df.columns),
+                        'shops': validation_result.get('shops', []),
+                        'date_range': validation_result.get('date_range', {})
+                    }
+                )
+            except Exception as db_error:  # pylint: disable=broad-except
+                logger.warning(f"Database session creation warning: {db_error}")
+
+            logger.info(
+                "Upload validation succeeded | session_id=%s rows=%s columns=%s",
+                session_id,
+                len(df),
+                len(df.columns)
+            )
+
+            return jsonify(response_payload)
+
+        except Exception as e:  # pylint: disable=broad-except
+            return jsonify({'error': f'ファイル読み込みエラー: {str(e)}'}), 400
+
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Upload error: {e}')
+        return jsonify({'error': f'アップロードエラー: {str(e)}'}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health_check() -> Any:
     """
@@ -633,44 +900,40 @@ def analyze_timeseries() -> Any:
     try:
         payload = request.get_json(force=True)
         session_id = validate_session_id(payload.get('session_id'))
-        metric = validate_metric(payload.get('metric'))
+
+        # 先にデータフレームを取得
+        df = get_dataframe_for_analysis(session_id)
+
+        # データセットに存在する数値カラムを取得
+        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        logger.info(f'[Timeseries] Available numeric columns: {numeric_cols}')
+
+        # metricが指定されていない、または存在しない場合、最初の数値カラムを使用
+        requested_metric = payload.get('metric')
+        if not requested_metric or requested_metric not in df.columns:
+            metric = numeric_cols[0] if numeric_cols else 'value'
+            logger.info(f'[Timeseries] Auto-selected metric: {metric} (requested: {requested_metric})')
+        else:
+            metric = requested_metric
+            logger.info(f'[Timeseries] Using requested metric: {metric}')
+
         time_unit = validate_time_unit(payload.get('time_unit'))
         store = validate_store(payload.get('store'))
 
+        # Date filters (NEW)
+        start_date = payload.get('start_date')
+        end_date = payload.get('end_date')
+
+        # Apply date filters (NEW)
+        df = filter_dataframe_by_date(df, start_date, end_date)
+
         # セッション保存（追加）
         db.save_session(session_id, store=store)
-
-        df = load_session_dataframe(session_id)
         analyzer = TimeSeriesAnalyzer(df)
         analysis_result = analyzer.analyze(metric=metric, time_unit=time_unit, store=store)
 
-        # 実行時間計測（追加）
-        execution_time = time.time() - start_time
-
-        # 分析結果をデータベースに保存（追加）
-        analysis_id = db.save_analysis_result(
-            session_id=session_id,
-            analysis_type='timeseries',
-            store=store,
-            target_column=metric,
-            parameters={
-                'metric': metric,
-                'time_unit': time_unit,
-                'store': store
-            },
-            results=analysis_result,
-            execution_time=execution_time
-        )
-
-        # レスポンスにメタデータ追加（追加）
-        response_data = {
-            'analysis_id': analysis_id,
-            'session_id': session_id,
-            'execution_time': round(execution_time, 3),
-            **analysis_result
-        }
-
-        return build_success_response(response_data)
+        # Return results directly without wrapper (CHANGED)
+        return jsonify(analysis_result)
     except FileNotFoundError as exc:
         logger.warning('Time series analysis failed: %s', exc)
         return build_error_response(str(exc), status_code=404, code='SESSION_NOT_FOUND')
@@ -692,40 +955,37 @@ def analyze_histogram() -> Any:
     try:
         payload = request.get_json(force=True)
         session_id = validate_session_id(payload.get('session_id'))
-        metric = validate_metric(payload.get('metric'))
+
+        # 先にデータフレームを取得
+        df = get_dataframe_for_analysis(session_id)
+
+        # データセットに存在する数値カラムを取得
+        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+        # metricが指定されていない、または存在しない場合、最初の数値カラムを使用
+        requested_metric = payload.get('metric')
+        if not requested_metric or requested_metric not in df.columns:
+            metric = numeric_cols[0] if numeric_cols else 'value'
+        else:
+            metric = requested_metric
+
         bins = validate_bins(payload.get('bins'))
         store = validate_store(payload.get('store'))
 
+        # Date filters (NEW)
+        start_date = payload.get('start_date')
+        end_date = payload.get('end_date')
+
+        # Apply date filters (NEW)
+        df = filter_dataframe_by_date(df, start_date, end_date)
+
         # セッション保存
         db.save_session(session_id, store=store)
-
-        df = load_session_dataframe(session_id)
         analyzer = HistogramAnalyzer(df)
         analysis_result = analyzer.analyze(metric=metric, bins=bins, store=store)
 
-        # 実行時間計測
-        execution_time = time.time() - start_time
-
-        # データベース保存
-        analysis_id = db.save_analysis_result(
-            session_id=session_id,
-            analysis_type='histogram',
-            store=store,
-            target_column=metric,
-            parameters={'metric': metric, 'bins': bins, 'store': store},
-            results=analysis_result,
-            execution_time=execution_time
-        )
-
-        # レスポンス
-        response_data = {
-            'analysis_id': analysis_id,
-            'session_id': session_id,
-            'execution_time': round(execution_time, 3),
-            **analysis_result
-        }
-
-        return build_success_response(response_data)
+        # Return results directly without wrapper (CHANGED)
+        return jsonify(analysis_result)
     except FileNotFoundError as exc:
         logger.warning('Histogram analysis failed: %s', exc)
         return build_error_response(str(exc), status_code=404, code='SESSION_NOT_FOUND')
@@ -747,8 +1007,28 @@ def analyze_pareto() -> Any:
     try:
         payload = request.get_json(force=True)
         session_id = validate_session_id(payload.get('session_id'))
-        metric = validate_metric(payload.get('metric'))
-        category_column = payload.get('category_column')
+
+        # 先にデータフレームを取得
+        df = get_dataframe_for_analysis(session_id)
+
+        # データセットに存在する数値カラムを取得
+        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+        # metricが指定されていない、または存在しない場合、最初の数値カラムを使用
+        requested_metric = payload.get('metric')
+        if not requested_metric or requested_metric not in df.columns:
+            metric = numeric_cols[0] if numeric_cols else 'value'
+        else:
+            metric = requested_metric
+
+        # category_columnが指定されていない、または存在しない場合、非数値カラムから選択
+        requested_category = payload.get('category_column')
+        if not requested_category or requested_category not in df.columns:
+            non_numeric_cols = df.select_dtypes(exclude=['int64', 'float64']).columns.tolist()
+            category_column = non_numeric_cols[0] if non_numeric_cols else None
+        else:
+            category_column = requested_category
+
         store = validate_store(payload.get('store'))
         top_n = payload.get('top_n', 20)
 
@@ -757,8 +1037,6 @@ def analyze_pareto() -> Any:
 
         # セッション保存
         db.save_session(session_id, store=store)
-
-        df = load_session_dataframe(session_id)
         analyzer = ParetoAnalyzer(df)
         analysis_result = analyzer.analyze(
             metric=metric,
@@ -803,6 +1081,252 @@ def analyze_pareto() -> Any:
         return build_error_response(str(exc), status_code=400, code='VALIDATION_ERROR')
     except Exception as exc:  # pylint: disable=broad-except
         logger.error('Unexpected Pareto error: %s', exc, exc_info=True)
+        return build_error_response('Internal server error', status_code=500, code='INTERNAL_ERROR')
+
+
+# ============================================================
+# Pareto Analysis V2 - Product Category Support
+# ============================================================
+
+@app.route('/api/v2/analysis/pareto', methods=['POST'])
+def analyze_pareto_v2() -> Any:
+    """
+    パレート分析API V2（商品カテゴリ対応版）
+
+    Request Body:
+    {
+        "session_id": "session_20251027_120922",
+        "category_type": "product_category" | "shop",
+        "metric": "Total_Sales",
+        "shop": "恵比寿" (optional),
+        "start_date": "2019-04-30" (optional),
+        "end_date": "2024-12-31" (optional)
+    }
+    """
+    try:
+        payload = request.get_json(force=True)
+        session_id = validate_session_id(payload.get('session_id'))
+        category_type = payload.get('category_type', 'product_category')
+        metric = payload.get('metric', 'Total_Sales')
+        shop_filter = payload.get('shop')
+        start_date = payload.get('start_date')
+        end_date = payload.get('end_date')
+
+        logger.info(f'[Pareto V2] Request: session={session_id}, category_type={category_type}, metric={metric}')
+
+        # Get dataframe
+        df = get_dataframe_for_analysis(session_id)
+
+        # Apply filters
+        if shop_filter and 'shop' in df.columns:
+            df = df[df['shop'] == shop_filter]
+
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+            if start_date:
+                # タイムゾーン情報を削除して tz-naive な datetime として比較
+                start_ts = pd.to_datetime(start_date)
+                if start_ts.tzinfo is not None:
+                    start_ts = start_ts.tz_localize(None)
+                df = df[df['Date'] >= start_ts]
+            if end_date:
+                # タイムゾーン情報を削除して tz-naive な datetime として比較
+                end_ts = pd.to_datetime(end_date)
+                if end_ts.tzinfo is not None:
+                    end_ts = end_ts.tz_localize(None)
+                df = df[df['Date'] <= end_ts]
+
+        if len(df) == 0:
+            return build_error_response('フィルタ条件に一致するデータがありません', status_code=400)
+
+        # ============================================================
+        # 商品カテゴリベースのパレート分析
+        # ============================================================
+        if category_type == 'product_category':
+            category_columns = [
+                'Mens_JACKETS&OUTER2',
+                'Mens_KNIT',
+                'Mens_PANTS',
+                "WOMEN'S_JACKETS2",
+                "WOMEN'S_TOPS",
+                "WOMEN'S_ONEPIECE",
+                "WOMEN'S_bottoms",
+                "WOMEN'S_SCARF & STOLES"
+            ]
+
+            category_labels = {
+                'Mens_JACKETS&OUTER2': 'メンズ ジャケット・アウター',
+                'Mens_KNIT': 'メンズ ニット',
+                'Mens_PANTS': 'メンズ パンツ',
+                "WOMEN'S_JACKETS2": 'レディース ジャケット',
+                "WOMEN'S_TOPS": 'レディース トップス',
+                "WOMEN'S_ONEPIECE": 'レディース ワンピース',
+                "WOMEN'S_bottoms": 'レディース ボトムス',
+                "WOMEN'S_SCARF & STOLES": 'レディース スカーフ・ストール'
+            }
+
+            # Calculate totals for each category
+            category_sales = {}
+            for col in category_columns:
+                if col in df.columns:
+                    # validate_uploadで変換済みだが、二重チェックとして
+                    # 文字列カラムをsum()すると500エラーになるため、数値に変換
+                    try:
+                        total = pd.to_numeric(df[col], errors='coerce').sum()
+                    except Exception:
+                        total = 0.0
+                    if pd.notna(total) and total > 0:
+                        category_sales[category_labels.get(col, col)] = total
+
+            if len(category_sales) == 0:
+                return build_error_response('商品カテゴリデータが見つかりません', status_code=400)
+
+            # Sort descending
+            sorted_data = sorted(category_sales.items(), key=lambda x: x[1], reverse=True)
+            categories = [item[0] for item in sorted_data]
+            values = [item[1] for item in sorted_data]
+
+        # ============================================================
+        # 店舗ベースのパレート分析
+        # ============================================================
+        elif category_type == 'shop':
+            if 'shop' not in df.columns:
+                return build_error_response('shop列が見つかりません', status_code=400)
+
+            shop_sales = df.groupby('shop')[metric].sum().sort_values(ascending=False)
+            categories = shop_sales.index.tolist()
+            values = shop_sales.values.tolist()
+
+        else:
+            return build_error_response(f'未対応のcategory_type: {category_type}', status_code=400)
+
+        # ============================================================
+        # Calculate cumulative percentage and ABC classification
+        # ============================================================
+        total = sum(values)
+
+        # エッジケース対応: フィルタリング後に合計が0になる場合のゼロ除算を防ぐ
+        if total == 0:
+            return build_error_response(
+                'フィルタ条件に一致するデータの合計が0です。フィルタ条件を変更してください。',
+                status_code=400
+            )
+
+        cumulative_sum = np.cumsum(values)
+        cumulative_percentage = (cumulative_sum / total * 100).tolist()
+
+        # ABC classification
+        abc_classification = {}
+        for i, category in enumerate(categories):
+            cumulative = cumulative_percentage[i]
+            if cumulative <= 80:
+                abc_classification[category] = 'A'
+            elif cumulative <= 95:
+                abc_classification[category] = 'B'
+            else:
+                abc_classification[category] = 'C'
+
+        # Statistics
+        a_count = sum(1 for v in abc_classification.values() if v == 'A')
+        b_count = sum(1 for v in abc_classification.values() if v == 'B')
+        c_count = sum(1 for v in abc_classification.values() if v == 'C')
+
+        result = {
+            'categories': categories,
+            'values': values,
+            'cumulative_percentage': cumulative_percentage,
+            'abc_classification': abc_classification,
+            'statistics': {
+                'total': float(total),
+                'a_items': a_count,
+                'b_items': b_count,
+                'c_items': c_count
+            }
+        }
+
+        logger.info(f'[Pareto V2] Success: {len(categories)} categories processed')
+        return jsonify(result)
+
+    except FileNotFoundError as exc:
+        logger.warning('Pareto V2 failed: %s', exc)
+        return build_error_response(str(exc), status_code=404, code='SESSION_NOT_FOUND')
+    except ValueError as exc:
+        logger.warning('Pareto V2 validation error: %s', exc)
+        return build_error_response(str(exc), status_code=400, code='VALIDATION_ERROR')
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error('Unexpected Pareto V2 error: %s', exc, exc_info=True)
+        return build_error_response('Internal server error', status_code=500, code='INTERNAL_ERROR')
+
+
+# ============================================================
+# LangChain Narrative API (Phase 3 scaffold)
+# ============================================================
+
+
+@app.route('/api/v2/analysis/langchain', methods=['POST'])
+@require_api_key
+def analyze_langchain_narrative() -> Any:
+    """Generate a LangChain-based narrative comparing two stores."""
+    try:
+        payload = request.get_json(force=True)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning('Invalid JSON payload for LangChain endpoint: %s', exc)
+        return build_error_response('Invalid JSON payload', status_code=400, code='INVALID_JSON')
+
+    try:
+        session_id = validate_session_id(payload.get('session_id'))
+        store_a = payload.get('store_a')
+        store_b = payload.get('store_b')
+        if not store_a or not store_b:
+            raise ValueError('store_a と store_b は必須です')
+
+        category_columns = payload.get('category_columns') or list(LANGCHAIN_DEFAULT_CATEGORIES)
+        if not isinstance(category_columns, list):
+            raise ValueError('category_columns はリストで指定してください')
+
+        df = get_dataframe_for_analysis(session_id)
+
+        store_columns = ['shop', '店舗名']
+        store_column = next((col for col in store_columns if col in df.columns), None)
+        if store_column is None:
+            raise ValueError('店舗判別用のカラム(shop/店舗名)が見つかりません')
+
+        filtered_df = df[df[store_column].isin([store_a, store_b])].copy()
+        if filtered_df.empty:
+            return build_error_response('指定された店舗のデータが見つかりません', status_code=404, code='STORE_NOT_FOUND')
+
+        numeric_targets = set(category_columns)
+        numeric_targets.update({
+            'Total_Sales',
+            'gross_profit',
+            'Operating_profit',
+            'Number_of_guests',
+            'Price_per_customer'
+        })
+
+        for column in numeric_targets:
+            if column in filtered_df.columns:
+                filtered_df[column] = pd.to_numeric(filtered_df[column], errors='coerce')
+
+        filtered_df.attrs['category_columns'] = category_columns
+
+        comparison_result = generate_store_comparison(filtered_df, store_a, store_b)
+
+        response_payload = {
+            'summary': comparison_result.get('summary', ''),
+            'stores': [store_a, store_b],
+            'evidence': comparison_result.get('evidence', {}),
+        }
+
+        return build_success_response(response_payload)
+    except ValueError as exc:
+        logger.warning('LangChain narrative validation error: %s', exc)
+        return build_error_response(str(exc), status_code=400, code='VALIDATION_ERROR')
+    except FileNotFoundError as exc:
+        logger.warning('LangChain narrative session not found: %s', exc)
+        return build_error_response(str(exc), status_code=404, code='SESSION_NOT_FOUND')
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error('LangChain narrative unexpected error: %s', exc, exc_info=True)
         return build_error_response('Internal server error', status_code=500, code='INTERNAL_ERROR')
 
 
@@ -946,4 +1470,4 @@ if __name__ == '__main__':
     config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     logger.info('Starting Q-Storm Platform (improved app)')
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5004, debug=False)
